@@ -93,7 +93,9 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (Device, FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.version import __version__ as VLLM_VERSION
-
+import configparser
+import nacos
+from urllib.parse import urlparse
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -1037,7 +1039,40 @@ def create_server_socket(addr: tuple[str, int]) -> socket.socket:
     sock.bind(addr)
 
     return sock
-
+def register_service(client,service_name,service_ip,service_port,cluster_name,health_check_interval,weight,http_proxy,domain,protocol,direct_domain):
+    try:
+        # 初始化 metadata
+        metadata = {
+            "lora": None,
+            "lora_scale": 1.0
+        }
+        
+        # 如果 http_proxy 为 True，添加额外的 metadata 键值对
+        if http_proxy:
+            metadata["http_proxy"] = True
+            if direct_domain:
+                metadata["domain"] = f"{protocol}://{service_ip}:{service_port}"
+            else:
+                metadata["domain"] = f"{domain}/port/{service_port}"
+        else:
+            metadata["http_proxy"] = False
+            metadata["domain"] = f"{protocol}://{service_ip}:{service_port}"
+        response = client.add_naming_instance(
+            service_name,
+            service_ip,
+            service_port,
+            cluster_name,
+            weight,
+            metadata,
+            enable=True,
+            healthy=True,
+            ephemeral=True,
+            heartbeat_interval=health_check_interval
+        )
+        return response
+    except Exception as e:
+        print(f"Error registering service to Nacos: {e}")
+        return True
 
 async def run_server(args, **uvicorn_kwargs) -> None:
     logger.info("vLLM API server version %s", VLLM_VERSION)
@@ -1090,26 +1125,89 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         logger.info("Starting vLLM API server on http%s://%s:%d",
                     "s" if is_ssl else "", _listen_addr(sock_addr[0]),
                     sock_addr[1])
+        # 在此处加入 Nacos 注册发现
 
-        shutdown_task = await serve_http(
-            app,
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            **uvicorn_kwargs,
+        # 读取配置文件
+        config = configparser.ConfigParser()
+        if not config.read('config.ini'):
+            raise RuntimeError("配置文件不存在")
+        # Nacos 相关配置
+        NACOS_SERVER = config['nacos']['nacos_server']
+        NAMESPACE = config['nacos']['namespace']
+        CLUSTER_NAME = config['nacos']['cluster_name']
+        SERVICE_NAME = config['nacos']['service_name']
+        HEALTH_CHECK_INTERVAL = int(config['nacos']['health_check_interval'])
+        WEIGHT = int(config['nacos'].get('weight', 1))
+        # 服务相关配置
+        HTTP_PROXY = config.getboolean('server', 'http_proxy')
+        DOMAIN = config['server']['domain']
+        # 如果你希望使用配置文件中的协议，可这样设置，否则也可以直接使用前面定义的 protocol
+        PROTOCOL = config['server']['protocol']
+        DIRECT_DOMAIN = config['server']['direct_domain']
+        logger.info(f"Nacos API: {NACOS_SERVER}")
+        # 从环境变量中解析 AutoDLServiceURL 得到当前服务的 IP 和端口
+        autodl_url = os.environ.get('AutoDLServiceURL')
+        if not autodl_url:
+            raise RuntimeError("Error: AutoDLServiceURL environment variable is not set.")
+        logger.info(f"AutoDLService URL: {autodl_url}")
+        parsed_url = urlparse(autodl_url)
+        SERVICE_IP = parsed_url.hostname
+        SERVICE_PORT = parsed_url.port
+        if not SERVICE_IP or not SERVICE_PORT:
+            raise RuntimeError("Error: Invalid AutoDLServiceURL format.")
+        logger.info(f"Service will be registered with IP: {SERVICE_IP} and Port: {SERVICE_PORT}")
+
+        # 创建 Nacos 客户端
+        client = nacos.NacosClient(NACOS_SERVER, namespace=NAMESPACE, ak=config['nacos']['ak'], sk=config['nacos']['sk'])
+        loop = asyncio.get_running_loop()
+        # 使用 run_in_executor 调用同步注册函数，避免阻塞 event loop
+        register_result = await loop.run_in_executor(
+            None,
+            register_service,
+            client,
+            SERVICE_NAME,
+            SERVICE_IP,
+            SERVICE_PORT,
+            CLUSTER_NAME,
+            HEALTH_CHECK_INTERVAL,
+            WEIGHT,
+            HTTP_PROXY,
+            DOMAIN,
+            PROTOCOL,
+            DIRECT_DOMAIN
         )
-
-    # NB: Await server shutdown only after the backend context is exited
+        if not register_result:
+            raise RuntimeError("Service is healthy but failed to register.")
+        # -------------------------
+        try:
+            shutdown_task = await serve_http(
+                app,
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                # no access log will be output.
+                access_log=not args.disable_uvicorn_access_log,
+                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                **uvicorn_kwargs,
+            )
+        finally:
+            # HTTP 服务关闭时注销 nacos 服务
+            await loop.run_in_executor(
+                None,
+                client.remove_naming_instance,
+                SERVICE_NAME,
+                SERVICE_IP,
+                SERVICE_PORT,
+                CLUSTER_NAME
+            )
+    # NB: 后端上下文退出后，再等待服务器关闭
     try:
         await shutdown_task
     finally:
